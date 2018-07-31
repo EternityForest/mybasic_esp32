@@ -911,6 +911,9 @@ typedef struct mb_interpreter_t {
   mb_print_func_t printer;
   mb_input_func_t inputer;
   mb_import_handler_t import_handler;
+
+  struct mb_interpreter_t * parent;
+
 } mb_interpreter_t;
 
 /* Operations */
@@ -12050,12 +12053,47 @@ int mb_dispose(void) {
 }
 
 
-//Open an interpreter that shares the same state as the parent,
-//Letting you run 2 programs(not at the same time) tht share variables.
-int mb_open_shared(struct mb_interpreter_t** s, struct mb_interpreter_t** parent) {
+
+//Calling export(var) will assign the value of var to a variable
+//with the same name to the interpreter's parent's global scope
+//Or this global scope, if the interpreter doesn't have one.
+static int _mb_export(struct mb_interpreter_t* s, void** l) {
+	int result = MB_FUNC_OK;
+	void* v0 = 0;
+  char *n = 0;
+	mb_value_t val0;
+
+	mb_assert(s && l);
+
+	mb_check(mb_attempt_open_bracket(s, l));
+
+  //Get the name of the variable
+	mb_check(mb_get_var(s, l, &v0, true));
+  mb_check(mb_get_var_name( s,v0, n));
+  
+  //Get the actual value of that var, and stash
+	mb_check(mb_get_var_value(s, v0, &val0));
+	mb_check(mb_attempt_close_bracket(s, l));
+
+  if(s->parent)
+  {
+    mb_add_var(s->parent,l, n,val0,true);
+  }
+  else
+  {
+    mb_add_var(s,l, n,val0,true);
+  }
+	return result;
+}
+//Open an interpreter that shares a global function dict,
+//And exists in a child scope of the parent. So you 
+int mb_open_child(struct mb_interpreter_t** s, struct mb_interpreter_t** parent) {
   mb_open(s);
   (*s)->global_func_dict = (*parent)->global_func_dict;
   (*s)->running_context->prev = (*parent)->running_context;
+  (*s)-> parent = *parent;
+  mb_register_func(*s, "EXPORT", _mb_export);
+
 }
 
 
@@ -12072,6 +12110,8 @@ int mb_open(struct mb_interpreter_t** s) {
   *s = (mb_interpreter_t*)mb_malloc(sizeof(mb_interpreter_t));
   memset(*s, 0, sizeof(mb_interpreter_t));
   (*s)->valid = true;
+
+  (*s)-> parent = 0;
 
   local_scope = _ht_create(0, _ht_cmp_string, _ht_hash_string, _ls_free_extra);
   (*s)->local_func_dict = local_scope;
