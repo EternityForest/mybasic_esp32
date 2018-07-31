@@ -589,8 +589,11 @@ MBAPI const char* mb_ver_string(void);
 MBAPI int mb_init(void);
 MBAPI int mb_dispose(void);
 MBAPI int mb_open(struct mb_interpreter_t** s);
+MBAPI int mb_open_child(struct mb_interpreter_t** s, struct mb_interpreter_t** parent);
 MBAPI int mb_close(struct mb_interpreter_t** s);
 MBAPI int mb_reset(struct mb_interpreter_t** s, bool_t clrf/* = false*/);
+MBAPI int mb_reset_preserve(struct mb_interpreter_t** s, bool_t clrf/* = false*/);
+
 
 MBAPI int mb_fork(struct mb_interpreter_t** s, struct mb_interpreter_t* r, bool_t clfk/* = true*/);
 MBAPI int mb_join(struct mb_interpreter_t** s);

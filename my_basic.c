@@ -3198,7 +3198,7 @@ static void _resize_dynamic_buffer(_dynamic_buffer_t* buf, size_t es, size_t c) 
     buf->pointer.charp = (char*)mb_malloc(as);
     buf->size = as;
   }
-}
+  }
 
 /* Allocate a chunk of memory with a specific size */
 static void* mb_malloc(size_t s) {
@@ -10634,7 +10634,8 @@ static int _clear_scope_chain(mb_interpreter_t* s) {
   int result = 0;
   _running_context_t* running = 0;
   _running_context_t* prev = 0;
-
+  
+  char stopFlag = 0;
   mb_assert(s);
 
   running = s->running_context;
@@ -10643,6 +10644,12 @@ static int _clear_scope_chain(mb_interpreter_t* s) {
 
     _ht_foreach(running->var_dict, _destroy_object);
     _ht_clear(running->var_dict);
+
+    //If we just cleared an interpreters root context, stop before we get to the parent context
+    if (stopFlag)
+    {
+      break;
+    }
 #ifdef MB_ENABLE_LAMBDA
     if(running->refered_lambdas)
       _ls_clear(running->refered_lambdas);
@@ -10650,6 +10657,11 @@ static int _clear_scope_chain(mb_interpreter_t* s) {
 
     result++;
     running = prev;
+    //We've reached a meta_root, we can stop now before we get to the parent.
+    if(running->meta = _SCOPE_META_ROOT)
+    {
+      stopFlag = 1;
+    }
   }
 
   return result;
@@ -12037,6 +12049,16 @@ int mb_dispose(void) {
   return MB_FUNC_OK;
 }
 
+
+//Open an interpreter that shares the same state as the parent,
+//Letting you run 2 programs(not at the same time) tht share variables.
+int mb_open_shared(struct mb_interpreter_t** s, struct mb_interpreter_t** parent) {
+  mb_open(s);
+  (*s)->global_func_dict = (*parent)->global_func_dict;
+  (*s)->running_context->prev = (*parent)->running_context;
+}
+
+
 /* Open a MY-BASIC environment */
 int mb_open(struct mb_interpreter_t** s) {
   int result = MB_FUNC_OK;
@@ -12190,12 +12212,11 @@ int mb_close(struct mb_interpreter_t** s) {
 }
 
 /* Reset a MY-BASIC environment */
-int mb_reset(struct mb_interpreter_t** s, bool_t clrf) {
+int _mb_reset(struct mb_interpreter_t** s, bool_t clrf, bool_t clearvars) {
   int result = MB_FUNC_OK;
   _ht_node_t* global_scope = 0;
   _ls_node_t* ast;
   _running_context_t* running = 0;
-
   if(!s || !(*s))
     return MB_FUNC_ERR;
 
@@ -12230,9 +12251,11 @@ int mb_reset(struct mb_interpreter_t** s, bool_t clrf) {
   _ls_clear((*s)->multiline_enabled);
 #endif /* _MULTILINE_STATEMENT */
 
-  _tidy_scope_chain(*s);
-  _clear_scope_chain(*s);
-
+  if(clearvars)
+  {
+    _tidy_scope_chain(*s);
+    _clear_scope_chain(*s);
+  }
 #ifdef MB_ENABLE_FORK
   if((*s)->all_forked) {
     mb_assert(_ls_count((*s)->all_forked) == 0);
@@ -12262,59 +12285,14 @@ int mb_reset(struct mb_interpreter_t** s, bool_t clrf) {
   return result;
 }
 
-/* Fork a new MY-BASIC environment */
-int mb_fork(struct mb_interpreter_t** s, struct mb_interpreter_t* r, bool_t clfk) {
-#ifdef MB_ENABLE_FORK
-  int result = MB_FUNC_OK;
-  _running_context_t* running = 0;
 
-  if(!s || !r)
-    return MB_FUNC_ERR;
-
-  *s = (mb_interpreter_t*)mb_malloc(sizeof(mb_interpreter_t));
-  memcpy(*s, r, sizeof(mb_interpreter_t));
-
-  (*s)->edge_destroy_objects = _ls_create();
-  (*s)->lazy_destroy_objects = _ls_create();
-
-  running = _create_running_context(true);
-  running->meta = _SCOPE_META_ROOT;
-  (*s)->forked_context = (*s)->running_context = running;
-  running->prev = _get_root_scope(r->running_context);
-
-  (*s)->var_args = 0;
-
-  (*s)->sub_stack = _ls_create();
-
-  (*s)->in_neg_expr = _ls_create();
-
-#ifdef MB_ENABLE_STACK_TRACE
-  (*s)->stack_frames = _ls_create();
-#endif /* MB_ENABLE_STACK_TRACE */
-#if _MULTILINE_STATEMENT
-  (*s)->multiline_enabled = _ls_create();
-#endif /* _MULTILINE_STATEMENT */
-
-  (*s)->forked_from = r;
-
-  if(clfk) {
-    if(!r->all_forked)
-      r->all_forked = _ls_create();
-    _ls_pushback(r->all_forked, *s);
-  }
-
-  mb_assert(MB_FUNC_OK == result);
-
-  return result;
-#else /* MB_ENABLE_FORK */
-  mb_unrefvar(s);
-  mb_unrefvar(r);
-  mb_unrefvar(clfk);
-
-  return MB_FUNC_ERR;
-#endif /* MB_ENABLE_FORK */
+int mb_reset(struct mb_interpreter_t** s, bool_t clrf) {
+  _mb_reset(s, clrf, true);
 }
 
+int mb_reset_preserve(struct mb_interpreter_t** s, bool_t clrf) {
+  _mb_reset(s, clrf, false);
+}
 /* Join a forked MY-BASIC environment */
 int mb_join(struct mb_interpreter_t** s) {
 #ifdef MB_ENABLE_FORK
