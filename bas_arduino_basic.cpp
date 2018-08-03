@@ -41,10 +41,11 @@ static int bas_bytearray(struct mb_interpreter_t* s, void** l) {
 
 int xprintf(const char *format, ...)
 {
-  char buf[256];
+  char *buf = (char *)malloc(128);
+
   va_list ap;
   va_start(ap, format);
-  vsnprintf(buf, sizeof(buf), format, ap);
+  vsnprintf(buf, 128, format, ap);
   for (char *p = &buf[0]; *p; p++) // emulate cooked mode for newlines
   {
     if (*p == '\n')
@@ -52,6 +53,7 @@ int xprintf(const char *format, ...)
     Serial.write(*p);
   }
   va_end(ap);
+  free(buf);
 }
 
 

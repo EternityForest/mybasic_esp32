@@ -5,7 +5,8 @@
    Type your commands with only newline line endings.
    Then type a - at the start of a new line to reset everything and run the program.
 
-   Whenever you run the program, anything you type after that is part of a completely new program.
+   Whenever you run the program, anything you type after that is part of a completely new program, but the state(variables, functions)
+   stays.
 
    You have access to some functions that pretty much pass through straight through to the arduino functions(The constants like HIGH are not available though)
 
@@ -62,7 +63,7 @@ void setup() {
           bas_prgp = -1;
           mb_load_string(bas, bas_prg, true);
           mb_run(bas, true);
-          mb_reset(&bas, 0);
+          mb_reset_preserve(&bas, 0);
         }
       }
 
