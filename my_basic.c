@@ -916,7 +916,9 @@ typedef struct mb_interpreter_t {
 	mb_print_func_t printer;
 	mb_input_func_t inputer;
 	mb_import_handler_t import_handler;
-
+  
+	void (*yieldfunc)(struct mb_interpreter_t *);
+	int yieldcounter;
 	struct mb_interpreter_t * parent;
 
 } mb_interpreter_t;
@@ -2169,6 +2171,9 @@ static int _coll_move_next(mb_interpreter_t* s, void** l);
 #endif /* MB_ENABLE_COLLECTION_LIB */
 
 /** Lib information */
+
+
+static yield_interval = 100;
 
 #define _CORE_ID_TYPE "TYPE"
 
@@ -11101,14 +11106,23 @@ _exit:
 		end_of_ast = true;
 	}
 
-	do {
-		int ret = _stepped(s, ast);
-		if(result == MB_FUNC_OK)
-			result = ret;
 
-		if(end_of_ast && ast && ast->next) /* May be changed when stepping */
-			*l = ast->next;
-	} while(0);
+	if(s->yieldfunc)
+	{
+		s->yieldcounter -=1;
+		if(s->yieldcounter<1)
+		{
+			s->yieldfunc(s);
+			s->yieldcounter = yield_interval;
+		}
+	}
+	int ret = _stepped(s, ast);
+	if(result == MB_FUNC_OK)
+		result = ret;
+
+	if(end_of_ast && ast && ast->next) /* May be changed when stepping */
+		*l = ast->next;
+
 
 	return result;
 }
@@ -12271,6 +12285,7 @@ int _mb_reset(struct mb_interpreter_t** s, bool_t clrf, bool_t clearvars) {
 	(*s)->run_count = 0;
 	(*s)->has_run = false;
 	(*s)->jump_set = _JMP_NIL;
+	(*s)->yieldcounter = yield_interval;
 #ifdef MB_ENABLE_CLASS
 	(*s)->last_instance = 0;
 	(*s)->calling = false;
@@ -14622,6 +14637,19 @@ const char* mb_get_error_desc(mb_error_e err) {
 #endif /* MB_ENABLE_FULL_ERROR */
 }
 
+//Gets the parent interpreter if there is one
+struct mb_interpreter_t*  mb_get_parent(struct mb_interpreter_t* s)
+{
+	return s->parent;
+	
+} 
+
+///SEts a yield func to be called every ~200 instructions
+int mb_set_yield(struct mb_interpreter_t * s, void (*f)(struct mb_interpreter_t *))
+{
+	s->yieldfunc = f;
+}
+
 /* Set an error handler to a MY-BASIC environment */
 int mb_set_error_handler(struct mb_interpreter_t* s, mb_error_handler_t h) {
 	int result = MB_FUNC_OK;
@@ -14701,6 +14729,7 @@ bool_t mb_get_gc_enabled(struct mb_interpreter_t* s) {
 	return !s->gc.disabled;
 }
 
+
 /* Sets whether GC is enabled */
 int mb_set_gc_enabled(struct mb_interpreter_t* s, bool_t gc) {
 	if(!s) return MB_FUNC_ERR;
@@ -14738,6 +14767,23 @@ int mb_get_userdata(struct mb_interpreter_t* s, void** d) {
 
 	if(s && d)
 		*d = s->userdata;
+
+_exit:
+	return result;
+}
+
+/* Get the userdata of a MY-BASIC environment */
+int mb_get_suspent(struct mb_interpreter_t* s, void** d) {
+	int result = MB_FUNC_OK;
+
+	if(!s || !d) {
+		result = MB_FUNC_ERR;
+
+		goto _exit;
+	}
+
+	if(s && d)
+		*d = s->suspent_point;
 
 _exit:
 	return result;

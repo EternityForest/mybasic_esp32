@@ -677,12 +677,18 @@ MBAPI int mb_set_error_handler(struct mb_interpreter_t* s, mb_error_handler_t h)
 MBAPI int mb_set_printer(struct mb_interpreter_t* s, mb_print_func_t p);
 MBAPI int mb_set_inputer(struct mb_interpreter_t* s, mb_input_func_t p);
 
+
+MBAPI struct mb_interpreter_t* mb_get_parent(struct mb_interpreter_t* s);
+MBAPI int mb_set_yield(struct mb_interpreter_t * s, void (*f)(struct mb_interpreter_t *));
+
 MBAPI int mb_set_import_handler(struct mb_interpreter_t* s, mb_import_handler_t h);
 MBAPI int mb_set_memory_manager(mb_memory_allocate_func_t a, mb_memory_free_func_t f);
 MBAPI bool_t mb_get_gc_enabled(struct mb_interpreter_t* s);
 MBAPI int mb_set_gc_enabled(struct mb_interpreter_t* s, bool_t gc);
 MBAPI int mb_gc(struct mb_interpreter_t* s, int_t* collected/* = NULL*/);
 MBAPI int mb_get_userdata(struct mb_interpreter_t* s, void** d);
+MBAPI int mb_get_userdata(struct mb_interpreter_t* s, void** d);
+MBAPI int mb_get_suspent(struct mb_interpreter_t* s, void** d);
 MBAPI int mb_set_userdata(struct mb_interpreter_t* s, void* d);
 MBAPI int mb_gets(const char* pmt, char* buf, int s);
 MBAPI char* mb_memdup(const char* val, unsigned size);

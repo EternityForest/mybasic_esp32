@@ -1,405 +1,523 @@
+/*
+** Copyright (C) 2018 Daniel Dunn
+**
+** Permission is hereby granted, free of charge, to any person obtaining a copy of
+** this software and associated documentation files (the "Software"), to deal in
+** the Software without restriction, including without limitation the rights to
+** use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+** the Software, and to permit persons to whom the Software is furnished to do so,
+** subject to the following conditions:
+**
+** The above copyright notice and this permission notice shall be included in all
+** copies or substantial portions of the Software.
+**
+** THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+** IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+** FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+** COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+** IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+** CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+*/
+
 #include "Arduino.h"
 #include "bas_arduino.h"
 
 
+//The high level OOP API
+_MyBasic MyBasic;
+
+//Wait 10 million ticks which is probably days, but still assert it if it fails
+#define MB_LOCK assert(xSemaphoreTake(bas_gil,10000000))
+#define MB_UNLOCK xSemaphoreGive(bas_gil)
+
+//This is a set of queues
+static QueueHandle_t request_queue;
+
+//Allow up to 8 tasks
+static TaskHandle_t basTasks[8];
+
+//This is the queue used to request that a basic interpreter thread does something
+static QueueHandle_t requestqueue;
+
+//List of the interpreters for all loaded programs
+static mb_interpreter_t *loadedPrograms[16];
+
+//The root basic interpreter, passing a null pointer when getting by ID returns this
+mb_interpreter_t* bas_parent = NULL;
+
+//The global interpreter lock. Almost any messing
+//with of interpreters uses this.
+SemaphoreHandle_t bas_gil;
+
+
+//The userdata struct for each loadedProgram interpreter
+struct loadedProgram
+{
+  //This is how we can know which program to replace when updating with a new version
+  char programID[16];
+  //The first 30 bytes of a file identify its "version" so we don't
+  //replace things that don't need replacing.
+  char hash[30];
+
+
+  //1  or above if the program is busy, don't mess with it in any way except setting/getting vars and making sub-programs.
+  //0 means you can delete, replace, etc
+
+  //When a child interpreter runs, it increments all parents and itself.
+  //In this way it is kind of like a reference count.
+  char busy; 
+};
 
 
 
 
-
-
-
-
-
-static void _unref(struct mb_interpreter_t* s, void* d) {
-  free(d);
+//Given a string program ID, return the mb interpreter for it, or 0,
+//If it's not loaded.
+static mb_interpreter_t** _programForId(const char * id)
+{
+  struct loadedProgram * ud;
+  if (id == 0)
+  {
+    if (bas_parent)
+    {
+      return &bas_parent;
+    }
+    else
+    {
+      return 0;
+    }
+  }
+  for (char i = 0; i < 16; i++)
+  {
+    if (loadedPrograms[i])
+    {
+      mb_get_userdata(loadedPrograms[i], (void**)&ud);
+      if (strcmp(ud->programID, id) == 0)
+      {
+        return &loadedPrograms[i];
+      }
+    }
+  }
+  return 0;
 }
 
-static int bas_bytearray(struct mb_interpreter_t* s, void** l) {
+
+static char _mbisdirectlybusy(mb_interpreter_t * i)
+{
+  struct loadedProgram * ud;
+  mb_get_userdata(i, (void**)&ud);
+  if(ud->busy)
+  {
+    return 1;
+  }
+
+  return 0; 
+}
+
+//Return true if the interpreter, any parent, or any child is busy.
+//We don't explicitly check children(we don't even have refs to them)
+//but the children increment all ancestor busy counts when they are busy.
+static char _mbisbusy(mb_interpreter_t * i)
+{
+  struct loadedProgram * ud;
+  while(i)
+  {
+    mb_get_userdata(i, (void**)&ud);
+    if(ud->busy)
+    {
+      return 1;
+    }
+    i=mb_get_parent(i);
+  }
+  return 0; 
+}
+
+
+
+
+static void _mbsetbusy(mb_interpreter_t * i)
+{
+  struct loadedProgram * ud;
+
+  while(i)
+  {
+    mb_get_userdata(i, (void**)&ud);
+    ud->busy +=1;
+    i=mb_get_parent(i);
+  }
+  
+}
+
+static void _mbsetfree(mb_interpreter_t * i)
+{
+  struct loadedProgram * ud;
+
+  while(i)
+  {
+    mb_get_userdata(i, (void**)&ud);
+    ud->busy -=1;
+    i=mb_get_parent(i);
+  } 
+}
+
+
+//Represents a request to do something with
+struct BasRequest
+{
+  //Pointer tp the target of the request
+  mb_interpreter_t * interpreter;
+  //Object that represents what the interpreter should do.
+  //If it === interpreter, it means run loaded code
+  mb_value_t * object;
+  void * arg;
+};
+
+
+static void makeRequest(mb_interpreter_t * interpreter, mb_value_t * object)
+{
+  struct BasRequest br;
+  br.interpreter = interpreter;
+  br.object = object;
+  xQueueSend(request_queue, &br, portMAX_DELAY);
+}
+
+
+//Close a program by ID
+static void _closeProgram(const char * id)
+{
+  mb_interpreter_t ** old = _programForId(id);
+
+
+  struct loadedProgram * ud;
+  if (*old == 0)
+  {
+    return;
+  }
+
+  //This stops the program no matter what it's doing;
+  mb_schedule_suspend(*old, MB_FUNC_END);
+
+  ///Something can be "busy" without holding the lock if it yields.
+ while(_mbisdirectlybusy(*old))
+  {
+    MB_UNLOCK;
+    delay(2500);
+    MB_LOCK;
+  }
+
+  mb_get_userdata(*old, (void **)&ud);
+
+  free(ud);
+  mb_close(old);
+}
+
+
+
+
+static void BasicInterpreterTask(void *)
+{
+  struct BasRequest br;
+  struct loadedProgram * ud;
+
+  while (1)
+  {
+    xQueueReceive(request_queue, &br, portMAX_DELAY);
+    MB_LOCK;
+
+    //The only supported request right now is to run the loaded app,
+    //marked by the object being the interpreter.
+    if(!(br.interpreter==(mb_interpreter_t*)br.object))
+    {
+      return;
+    }
+
+
+    //We yield for 2500ms while that particular program is busy.
+    //Response time isn't an issue, programs should try to avoid
+    //Requesting busy apps anyway.
+    while(_mbisbusy(br.interpreter))
+    {
+      MB_UNLOCK;
+      delay(2500);
+      MB_LOCK;
+    }
+
+    _mbsetbusy(br.interpreter);
+     mb_run(br.interpreter, true);
+    _mbsetfree(br.interpreter);
+    MB_UNLOCK;
+  }
+}
+
+
+int bas_delay_rtos(struct mb_interpreter_t* s, void** l) {
   int result = MB_FUNC_OK;
-  int64_t len;
+  int64_t n = 0;
+  int r = 0;
   mb_assert(s && l);
-
   mb_check(mb_attempt_open_bracket(s, l));
-  mb_check(mb_pop_int(s, l, &len));
+  mb_check(mb_pop_int(s, l, &n));
   mb_check(mb_attempt_close_bracket(s, l));
-
-
-  mb_value_t ret;
-  //A little safety margin against off by one user error.
-  void * p = malloc(len + 2);
-  mb_make_ref_value(s, p, &ret, _unref, 0, 0, 0, 0);
-  mb_check(mb_push_value(s, l, ret));
-
-
+  
+  //Don't hold the GIL while delaying
+  MB_UNLOCK;
+  delay(n);
+  MB_LOCK;
   return result;
 }
 
 
-
-
-
-int xprintf(const char *format, ...)
+void _MyBasic::begin(char numThreads)
 {
-  char *buf = (char *)malloc(128);
 
-  va_list ap;
-  va_start(ap, format);
-  vsnprintf(buf, 128, format, ap);
-  for (char *p = &buf[0]; *p; p++) // emulate cooked mode for newlines
+  for (char i = 0; i < 16; i++)
   {
-    if (*p == '\n')
-      Serial.write('\r');
-    Serial.write(*p);
+    loadedPrograms[i] == 0;
   }
-  va_end(ap);
-  free(buf);
+  mb_init();
+
+
+  //Start the root interpreter
+  const char * code =  "'The only line in this root program currently is this comment";
+  mb_open(&bas_parent);
+  enableArduinoBindings(bas_parent);
+  mb_register_func(bas_parent, "delay", bas_delay_rtos);
+  mb_load_string(bas_parent,code, true);
+
+  struct loadedProgram * loadedprg = (struct loadedProgram *)malloc(sizeof(struct loadedProgram));
+  memcpy(loadedprg->hash, code, 30);
+  loadedprg->busy = 0;
+  mb_set_userdata(bas_parent, loadedprg);
+  rootInterpreter = bas_parent;
+
+  bas_gil = xSemaphoreCreateBinary( );
+  xSemaphoreGive(bas_gil);
+  request_queue = xQueueCreate( 25, sizeof(struct BasRequest));
+
+  for(char i =0; i<numThreads; i++)
+  {
+    xTaskCreatePinnedToCore(BasicInterpreterTask,
+                "BasicInterpreter1",
+                stackSize,
+                0,
+                1,
+                &basTasks[i],
+                1
+              );
+  }
 }
 
 
-static void _on_error(struct mb_interpreter_t* s, mb_error_e e, const char* m, const char* f, int p, unsigned short row, unsigned short col, int abort_code) {
-  mb_unrefvar(s);
-  mb_unrefvar(p);
 
-  if (e != SE_NO_ERR) {
-    if (f) {
-      if (e == SE_RN_WRONG_FUNCTION_REACHED) {
-        xprintf(
-          "Error:\n    Ln %d, Col %d in Func: %s\n    Code %d, Abort Code %d\n    Message: %s.\n",
-          row, col, f,
-          e, abort_code,
-          m
-        );
-      } else {
-        xprintf(
-          "Error:\n    Ln %d, Col %d in File: %s\n    Code %d, Abort Code %d\n    Message: %s.\n",
-          row, col, f,
-          e, e == SE_EA_EXTENDED_ABORT ? abort_code - MB_EXTENDED_ABORT : abort_code,
-          m
-        );
+void _MyBasic::lock()
+{
+  MB_LOCK;
+}
+
+void _MyBasic::unlock()
+{
+  MB_UNLOCK;
+}
+//Allow someone else to use the my-basic GIL, and don't return until we have the lock again.
+static void basyield(mb_interpreter_t *)
+{
+  MB_UNLOCK;
+  vTaskDelay(2);
+  MB_LOCK;
+}
+
+
+//Polls the interpreter until it's free. waiting sleepfor in between.
+//Should force_close be true, it will wait a maximum of retries before
+//Closing everything.
+void mb_wait_directly_free(mb_interpreter_t *s,int sleepfor, char force_close, int retries)
+{
+  
+      ///Something can be "busy" without holding the lock if it yields.
+     while(_mbisdirectlybusy(s))
+      {
+        MB_UNLOCK;
+
+        delay(sleepfor);
+        MB_LOCK;
+
+        if (force_close)
+        {
+          retries -=1;
+          if (retries ==-1)
+          {
+            mb_schedule_suspend(s, MB_FUNC_END);
+            retries = 5;
+          }
+        }
+    }
+}
+
+
+
+
+
+//Load a new program with the given ID, replacing any with the same ID if the
+//first 30 bytes are different.
+int _loadProgram(const char * code, const char * id)
+{
+  mb_interpreter_t ** old = _programForId(id);
+  struct loadedProgram * ud = 0;
+  //Check if programs are the same
+
+  if (old)
+  {
+    mb_get_userdata(*old, (void **)&ud);
+    //Check if the versions are the same
+    if (memcmp(ud->hash, code, 30) == 0)
+    {
+      return 0;
+    }
+
+    
+    ///Something can be "busy" without holding the lock if it yields.
+     while(_mbisdirectlybusy(*old))
+      {
+        MB_UNLOCK;
+        delay(2500);
+        MB_LOCK;
       }
-    } else {
-      xprintf(
-        "Error:\n    Ln %d, Col %d\n    Code %d, Abort Code %d\n    Message: %s.\n",
-        row, col,
-        e, e == SE_EA_EXTENDED_ABORT ? abort_code - MB_EXTENDED_ABORT : abort_code,
-        m
-      );
+
+    _closeProgram(id);
+  }
+
+
+  //This is a request to open the root interpreter
+  if (id == 0)
+  {
+    mb_open(&bas_parent);
+    enableArduinoBindings(bas_parent);
+    mb_load_string(bas_parent, code, true);
+
+    struct loadedProgram * loadedprg = (struct loadedProgram *)malloc(sizeof(struct loadedProgram));
+    memcpy(loadedprg->hash, code, 30);
+    loadedprg->busy = 0;
+    mb_set_userdata(bas_parent, loadedprg);
+    return 0;
+  }
+
+  //Find a free interpreter slot
+  for (char i = 0; i < 16; i++)
+  {
+    if (loadedPrograms[i] == 0)
+    {
+      mb_interpreter_t * n = 0;
+      mb_open_child(&n, &bas_parent);
+      mb_load_string(n, code, true);
+      mb_set_yield(n, basyield);
+
+      struct loadedProgram * loadedprg = (struct loadedProgram *) malloc(sizeof(struct loadedProgram));
+      memcpy(loadedprg->hash, code, 30);
+      strcpy(loadedprg->programID, id);
+      loadedprg->programID[strlen(id)] = 0;
+      loadedprg->busy = 0;
+
+      mb_set_userdata(n, loadedprg);
+      loadedPrograms[i] = n;
+      return 0;
     }
   }
+
+  //err, could not find free slot for program
+  return 1;
 }
 
-HardwareSerial Serial1(1);
-HardwareSerial Serial2(2);
-HardwareSerial Serial3(3);
-
-HardwareSerial * serports[3] = {&Serial, &Serial1, &Serial2};
 
 
-//serbegin(portnumber, baudrate, [txpin, rxpin])
-int bas_serbegin(struct mb_interpreter_t* s, void** l) {
-  int result = MB_FUNC_OK;
-  int64_t port = 0;
-  int64_t baud = 0;
 
-  int64_t rxpin = 0;
-  int64_t txpin = 0;
 
-  int r = 0;
-  mb_assert(s && l);
-  mb_check(mb_attempt_open_bracket(s, l));
-  mb_check(mb_pop_int(s, l, &port));
-  mb_check(mb_pop_int(s, l, &baud));
+//If a program with that ID exists, replace the code
+int _MyBasic::updateProgram(const char * code, const char * id)
+{
+  MB_LOCK;
+  mb_interpreter_t ** old = _programForId(id);
+  struct loadedProgram * ud = 0;
+  //Check if programs are the same
 
-  if (mb_has_arg(s, l)) {
-    mb_check(mb_pop_int(s, l, &rxpin));
-    mb_check(mb_pop_int(s, l, &txpin));
-    serports[port]->begin(baud, SERIAL_8N1, rxpin, txpin);
+  if (old)
+  {
+    mb_get_userdata(*old, (void **)&ud);
+    //Check if the versions are the same
+    if (memcmp(ud->hash, code, 30) == 0)
+    {
+      MB_UNLOCK;
+      return 0;
+    }
+    //Wait up to ten seconds, then tell the interpreter to stop whatever its doing.
+    mb_wait_directly_free(*old, 100, 1, 20);
+
+    mb_reset_preserve(old, 0);
+    mb_load_string(*old, code, true);
   }
   else
   {
-    mb_check(mb_attempt_close_bracket(s, l));
-    serports[port]->begin(baud);
-    return result;
+    _loadProgram(code, id);
   }
-  mb_check(mb_attempt_close_bracket(s, l));
-  return result;
+  MB_UNLOCK;
 }
 
-//sersend(port, data, len)
-int bas_sersend(struct mb_interpreter_t* s, void** l) {
-  int result = MB_FUNC_OK;
-  int64_t port = 0;
-  void * data = 0;
-  int64_t len = 0;
-
-  int r = 0;
-  mb_assert(s && l);
-  mb_check(mb_attempt_open_bracket(s, l));
-  mb_check(mb_pop_int(s, l, &port));
-
-  mb_value_t arg;
-  mb_make_nil(arg);
-  mb_check(mb_pop_value(s, l, &arg));
-  mb_check(mb_get_ref_value(s, l, arg, &data));
- 
-  
-  mb_check(mb_pop_int(s, l, &len));
-
-  
-  mb_check(mb_attempt_close_bracket(s, l));
-
-
-  serports[port]->write((uint8_t *)data, len);
-
-  return result;
-}
-
-
-int bas_pinMode(struct mb_interpreter_t* s, void** l) {
-  int result = MB_FUNC_OK;
-  int64_t m = 0;
-  int64_t n = 0;
-  int r = 0;
-  mb_assert(s && l);
-  mb_check(mb_attempt_open_bracket(s, l));
-  mb_check(mb_pop_int(s, l, &m));
-  mb_check(mb_pop_int(s, l, &n));
-  mb_check(mb_attempt_close_bracket(s, l));
-
-  //Dunno,maybe there's some pins or something that should not be set up that way.
-  pinMatrixInDetach(m, false, false);
-  pinMatrixOutDetach(m, false, false);
-  pinMode(m, n);
-  return result;
-}
-
-int bas_digitalWrite(struct mb_interpreter_t* s, void** l) {
-  int result = MB_FUNC_OK;
-  int64_t m = 0;
-  int64_t n = 0;
-  int r = 0;
-  mb_assert(s && l);
-  mb_check(mb_attempt_open_bracket(s, l));
-  mb_check(mb_pop_int(s, l, &m));
-  mb_check(mb_pop_int(s, l, &n));
-  mb_check(mb_attempt_close_bracket(s, l));
-  digitalWrite(m, n);
-  return result;
-}
-
-int bas_analogWrite(struct mb_interpreter_t* s, void** l) {
-  int result = MB_FUNC_OK;
-  int64_t m = 0;
-  int64_t n = 0;
-  int r = 0;
-  mb_assert(s && l);
-  mb_check(mb_attempt_open_bracket(s, l));
-  mb_check(mb_pop_int(s, l, &m));
-  mb_check(mb_pop_int(s, l, &n));
-  mb_check(mb_attempt_close_bracket(s, l));
-  //analogWrite(m, n);
-  return result;
-}
-
-int bas_analogRead(struct mb_interpreter_t* s, void** l) {
-  int result = MB_FUNC_OK;
-  int64_t n = 0;
-  int r = 0;
-  mb_assert(s && l);
-  mb_check(mb_attempt_open_bracket(s, l));
-  mb_check(mb_pop_int(s, l, &n));
-  mb_check(mb_attempt_close_bracket(s, l));
-  r = analogRead(n);
-  mb_check(mb_push_int(s, l, r));
-
-  return result;
-}
-
-
-
-
-
-
-int bas_millis(struct mb_interpreter_t* s, void** l) {
-  int result = MB_FUNC_OK;
-  int64_t n = 0;
-  int64_t r = 0;
-  mb_assert(s && l);
-  mb_check(mb_attempt_open_bracket(s, l));
-  mb_check(mb_attempt_close_bracket(s, l));
-  r = millis();
-  mb_check(mb_push_int(s, l, r));
-
-  return result;
-}
-
-
-
-//PEEK(bytearray, index)
-int bas_peek(struct mb_interpreter_t* s, void** l) {
-  int result = MB_FUNC_OK;
-  void * n = 0;
-  int64_t r = 0;
-  int64_t idx =0;
-  mb_assert(s && l);
-  mb_check(mb_attempt_open_bracket(s, l));
-
-  mb_value_t arg;
-  mb_make_nil(arg);
-  mb_check(mb_pop_value(s, l, &arg));
-  mb_check(mb_get_ref_value(s, l, arg, &n));
-  mb_check(mb_pop_int(s, l, &idx));
-
-  mb_check(mb_attempt_close_bracket(s, l));
-  uint8_t * p = (uint8_t *)n+idx;
-  r = *p;
-  mb_check(mb_push_int(s, l, r));
-
-  return result;
-}
-
-
-///Peekas(x,l,n), peek at position N in bytearray x interpreting it as an l-byte integer.
-int bas_peekas(struct mb_interpreter_t* s, void** l) {
-  int result = MB_FUNC_OK;
-  int64_t vlen = 0;
-  void * n = 0;
-  int64_t idx;
-
-
-  int64_t r = 0;
-  mb_assert(s && l);
-  mb_check(mb_attempt_open_bracket(s, l));
-
-
-  mb_value_t arg;
-  mb_make_nil(arg);
-  mb_check(mb_pop_value(s, l, &arg));
-  mb_check(mb_get_ref_value(s, l, arg, &n));
-
-
-  mb_check(mb_pop_int(s, l, &idx));
-  mb_check(mb_pop_int(s, l, &vlen));
-
-
-
-  mb_check(mb_attempt_close_bracket(s, l));
-
-
-  uint8_t * p = (uint8_t *)(n + idx);
-
-  while (vlen)
-  {
-    r *= 256;
-    r = *p;
-    vlen -= 1;
-    p += 1;
-  }
-  mb_check(mb_push_int(s, l, r));
-
-  return result;
-}
-
-
-
-//poke(bytearray, index, value)
-int bas_poke(struct mb_interpreter_t* s, void** l) {
-  int result = MB_FUNC_OK;
-  void * n = 0;
-  int64_t idx;
-
-  int64_t val;
-  int64_t r = 0;
-  mb_assert(s && l);
-  mb_check(mb_attempt_open_bracket(s, l));
-
-
-  mb_value_t arg;
-  mb_make_nil(arg);
-  mb_check(mb_pop_value(s, l, &arg));
-  mb_check(mb_get_ref_value(s, l, arg, &n));
-
-  mb_check(mb_pop_int(s, l, &idx));
-  mb_check(mb_pop_int(s, l, &val));
-
-
-  mb_check(mb_attempt_close_bracket(s, l));
-
-
-
-  uint8_t * p = ((uint8_t *)n);
-  *p = (uint8_t)val;
-  return result;
-}
-
-///pokeas(x,l,n, v), peek at position N interpreting it as an l-byte integer.
-int bas_pokeas(struct mb_interpreter_t* s, void** l) {
-  int result = MB_FUNC_OK;
-  int64_t vlen = 0;
-  void * n = 0;
-  int64_t idx;
-
-  int64_t val;
-  int64_t r = 0;
-  mb_assert(s && l);
-  mb_check(mb_attempt_open_bracket(s, l));
-
-
-  mb_value_t arg;
-  mb_make_nil(arg);
-  mb_check(mb_pop_value(s, l, &arg));
-  mb_check(mb_get_ref_value(s, l, arg, &n));
-
-
-  mb_check(mb_pop_int(s, l, &idx));
-  mb_check(mb_pop_int(s, l, &vlen));
-
-  mb_check(mb_pop_int(s, l, &val));
-
-
-  mb_check(mb_attempt_close_bracket(s, l));
-
-
-  uint8_t * p = (uint8_t *)(n + idx);
-
-  char i = 0;
-
-  while (vlen)
-  {
-
-    p[i] = ((uint8_t*)&val)[i];
-    i++;
-    vlen -= 1;
-  }
-  mb_check(mb_push_int(s, l, r));
-
-  return result;
-}
-
-
-void enableArduinoBindings(struct mb_interpreter_t* bas)
+//Allow someone else to use the my-basic GIL, and don't return until we have the lock again.
+void _MyBasic::yield()
 {
-  mb_set_printer(bas, xprintf);
-  mb_set_error_handler(bas, _on_error);
-
-  mb_register_func(bas, "analogRead", bas_analogRead);
-  mb_register_func(bas, "pinMode", bas_pinMode);
-  mb_register_func(bas, "digitalWrite", bas_digitalWrite);
-  mb_register_func(bas, "analogWrite", bas_analogWrite);
+  MB_UNLOCK;
+  MB_LOCK;
+}
 
 
-  mb_register_func(bas, "millis", bas_millis);
 
 
-  mb_register_func(bas, "peek", bas_peek);
-  mb_register_func(bas, "poke", bas_poke);
-  mb_register_func(bas, "peekas", bas_peekas);
-  mb_register_func(bas, "pokeas", bas_pokeas);
-  mb_register_func(bas, "malloc", bas_bytearray);
-  mb_register_func(bas, "sersend", bas_sersend);
 
 
+
+int _MyBasic::loadProgram(const char * code, const char * id)
+{
+
+  MB_LOCK;
+  int ret = _loadProgram(code, id);
+  MB_UNLOCK;
+  return ret;
+}
+
+
+
+
+void _MyBasic::runLoaded(char * id)
+{
+   makeRequest(*_programForId(id),(mb_value_t *)*_programForId(id));
+}
+
+
+void mbRunInProgram(char * source, const char * id)
+{
+  MB_LOCK;
+  struct mb_interpreter_t** program = _programForId(id);
+  mb_load_string(*program, source, true);
+  mb_run(*program, true);
+  mb_reset_preserve(program, 0);
+  MB_UNLOCK;
+}
+void mb_subshell(char * source, char * id)
+{
+  MB_LOCK;
+
+  struct mb_interpreter_t** parent = _programForId(id);
+  struct mb_interpreter_t* child = NULL;
+
+  mb_open_child(&child, parent);
+
+
+  //mb_set_printer(bas, xprintf);
+  mb_load_string(child, source, true);
+  mb_run(child, true);
+
+
+  mb_close(&child);
+  MB_UNLOCK;
 }
 
 
