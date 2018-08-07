@@ -32,10 +32,14 @@ class _MyBasic
     void begin(char);
     void yield();
     int updateProgram(const char *, const char *);
-    void runLoaded(char *);
+    void runLoaded(const char *);
     int loadProgram(const char *, const char *);
-    mb_interpreter_t * rootInterpreter;
 
+    int appendInput(const char * data, int len,const char * id);
+
+    mb_interpreter_t * rootInterpreter;
+    
+    mb_interpreter_t * getInterpreter(const char * id);
     void lock();
     void unlock();
 

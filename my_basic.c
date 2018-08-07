@@ -862,6 +862,15 @@ typedef struct mb_interpreter_t {
 	bool_t valid _PACK1;
 	void* userdata;
 	_ls_node_t* ast;
+
+	//When we enter a function durung parsing, we save the AST
+	//We have so far, and we restore it on exit.
+
+	//This is because we save function ASTs in a separate place.
+	_ls_node_t* saved_ast;
+
+
+
 	/** Memory management */
 	_gc_t gc;
 	_ls_node_t* edge_destroy_objects;
@@ -3213,12 +3222,22 @@ static void _resize_dynamic_buffer(_dynamic_buffer_t* buf, size_t es, size_t c) 
 	}
 	}
 
+
+void * reusable_buffer = 0;
+int reusable_buffer_size = 0;
+
 /* Allocate a chunk of memory with a specific size */
 static void* mb_malloc(size_t s) {
 	char* ret = 0;
 	size_t rs = s;
 
 #ifdef MB_ENABLE_ALLOC_STAT
+
+	if (s<=reusable_buffer_size)
+	{
+		reusable_buffer_size = 0;
+		return reusable_buffer;
+	}
 	if(!_MB_CHECK_MEM_TAG_SIZE(size_t, s))
 		return 0;
 	rs += _MB_MEM_TAG_SIZE;
@@ -3244,6 +3263,41 @@ static void mb_free(void* p) {
 #ifdef MB_ENABLE_ALLOC_STAT
 	do {
 		size_t os = _MB_READ_MEM_TAG_SIZE(p);
+		
+		//Heuristic, it's smallish objects that are going
+		//to be most often deallocated and replaced with one of similar size.
+		if(os<256)
+		{
+			//If there's already a reusable_buffer smaller than
+			//This one, free it.
+			//Don't just leave it and free this one, because
+			//Then a tiny reusable_buffer might never get used/
+			//and would just sit there.
+
+			//If the reusable_buffer is bigger than us,
+
+			if(reusable_buffer_size ==0)
+			{
+				reusable_buffer = p;
+				reusable_buffer_size = os;
+				return;			
+			}
+			//This buffer is bigger than the old one,
+			//free the old one because
+			//This one is more likely to be used in the future.
+			if(os> reusable_buffer_size)
+			{
+				_mb_allocated -= reusable_buffer_size;
+		        void * tofree = (char*)reusable_buffer - _MB_MEM_TAG_SIZE;
+				if(_mb_free_func)
+					_mb_free_func((char*)tofree);
+				else
+					free(_mb_free_func);
+				reusable_buffer = p;
+				reusable_buffer_size = os;
+				return;
+			}
+		}
 		_mb_allocated -= os;
 		p = (char*)p - _MB_MEM_TAG_SIZE;
 	} while(0);
@@ -9958,6 +10012,8 @@ _exit:
 	return result;
 }
 
+
+
 /* Destroy an object, including its data and extra data */
 static int _destroy_object_with_extra(void* data, void* extra) {
 	int result = _OP_RESULT_DEL_NODE;
@@ -10921,7 +10977,7 @@ static int _execute_statement(mb_interpreter_t* s, _ls_node_t** l, bool_t force_
 	bool_t skip_to_eoi = true;
 	bool_t end_of_ast = false;
 
-	mb_assert(s && l);
+	//mb_assert(s && l);
 
 	running = s->running_context;
 	sub_stack = s->sub_stack;
@@ -12111,6 +12167,8 @@ int mb_open_child(struct mb_interpreter_t** s, struct mb_interpreter_t** parent)
 	(*s)->global_func_dict = (*parent)->global_func_dict;
 	(*s)->printer = (*parent)->printer;
 	(*s)->inputer = (*parent)->inputer;
+	(*s)->error_handler = (*parent)->error_handler;
+	(*s)->import_handler = (*parent)->import_handler;
 
 	(*s)->running_context->prev = (*parent)->running_context;
 	(*s)-> parent = *parent;
@@ -12210,6 +12268,40 @@ int mb_close(struct mb_interpreter_t** s) {
 	_close_core_lib(*s);
 
 	ast = (*s)->ast;
+	/*
+	_ls_node_t* ast_i = ast; 
+	_ls_node_t* last = 0; 
+	_ls_node_t* before_func = 0; 
+	
+	if(!(_IS_FUNC((_object_t*)(ast_i->data), _core_def)))
+	{
+		//Loop over the whole collection of AST nodes,
+		//and unlink the ones that are functions.
+		//They are just floating, and we depend on garbage
+		//collection of the actual function object to clean the, 
+		while(ast_i)
+		{
+			if (_IS_FUNC((_object_t*)(ast_i->data), _core_def))
+			{
+				before_func= last;
+			}
+		if (_IS_FUNC((_object_t*)(ast_i->data), _core_enddef))
+			{
+				if(ast_i->next)
+				{
+					before_func->next =  ast_i->next; 
+				}
+				//Nothing after the def to splice
+				else
+				{
+					before_func->next=0;
+				}
+			}
+			last = ast_i;
+			ast_i=ast_i->next;
+		}
+	}
+	*/
 	_ls_foreach(ast, _destroy_object);
 	_ls_destroy(ast);
 
@@ -14181,6 +14273,10 @@ _exit:
 	return result;
 }
 
+
+
+word_def = "def";
+
 /* Load and parse a script string */
 int mb_load_string(struct mb_interpreter_t* s, const char* l, bool_t reset) {
 	int result = MB_FUNC_OK;
@@ -14189,6 +14285,8 @@ int mb_load_string(struct mb_interpreter_t* s, const char* l, bool_t reset) {
 	unsigned short _col = 0;
 	char wrapped = _ZERO_CHAR;
 	_parsing_context_t* context = 0;
+
+
 
 	if(!s || !l) {
 		result = MB_FUNC_ERR;

@@ -63,3 +63,5 @@ I've added the function mb_reset_preserve, which is just like mb_reset but doesn
 we can do a real REPL. We also have mb_set_yield, which allows you pass in a yield function called every 100 instructions. This library
 uses it to release the GIL, wait 2 freeRTOS ticks, and re-acquire it.
 
+Because of the way I handle memory allocation, the interpreter contexts now have shared state that means you can't access my-basic in different threads without a lock.
+

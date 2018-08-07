@@ -417,7 +417,7 @@ void enableArduinoBindings(struct mb_interpreter_t* bas)
 
 
   mb_register_func(bas, "millis", bas_millis);
-  mb_register_func(bas, "delay", bas_delay);
+  mb_register_func(bas, "DELAY", bas_delay);
 
 
   mb_register_func(bas, "peek", bas_peek);
